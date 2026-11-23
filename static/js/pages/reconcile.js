@@ -19,6 +19,13 @@ export async function renderReconcile(el) {
         <div class="stat"><div class="n">${dash.batches}</div><div class="l">批次数</div></div>
       </div>
       <div class="row">
+        <span class="chip ${dash.dead_letter_rework_badge ? 'warn' : 'idle'}">死信回炉徽标 ${dash.dead_letter_rework_badge || 0}</span>
+        <span class="chip ${dash.dead_letter_count ? 'warn' : 'idle'}">死信条数 ${dash.dead_letter_count || 0}</span>
+        <span class="chip ${(dash.dead_letter_guard || {}).rejected ? 'bad' : 'ok'}">
+          ${(dash.dead_letter_guard || {}).rejected ? '回炉口径驳回' : '回炉口径对齐'}
+        </span>
+      </div>
+      <div class="row">
         <button id="run">生成对账报告</button>
         <button id="reload" class="ghost">刷新</button>
       </div>
@@ -28,7 +35,7 @@ export async function renderReconcile(el) {
       <h2>中心缺口矩阵</h2>
       <table>
         <thead>
-          <tr><th>中心</th><th>状态</th><th>批次</th><th>访视行</th><th>缺口</th><th>开放发现</th></tr>
+          <tr><th>中心</th><th>状态</th><th>批次</th><th>访视行</th><th>缺口</th><th>开放发现</th><th>死信</th></tr>
         </thead>
         <tbody>
           ${(matrix.items || []).map((s) => `
@@ -39,6 +46,7 @@ export async function renderReconcile(el) {
               <td>${s.row_count}</td>
               <td>${s.gap_count || 0}</td>
               <td>${s.open_findings || 0}</td>
+              <td>${s.dead_letters || 0}</td>
             </tr>`).join('')}
         </tbody>
       </table>

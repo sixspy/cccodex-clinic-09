@@ -5,10 +5,25 @@ from datetime import datetime
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import dead_letters as dead_letter_svc
 from app.services import settings as settings_svc
 from app.services.errors import ServiceError
 
 JOB_STATUS = ("排队", "执行中", "成功", "失败")
+
+
+def _seal_if_exhausted(conn, job_id: int, max_attempt: int) -> None:
+    """连续失败达到上限即封存死信，杜绝任务静默消失。"""
+    job = conn.execute(
+        "SELECT * FROM backfill_jobs WHERE id=?", (job_id,)
+    ).fetchone()
+    if not job or job["status"] != "失败":
+        return
+    if job["attempt"] < max_attempt:
+        return
+    dead_letter_svc.seal_from_job(
+        conn, job_id, f"连续失败达到上限 {max_attempt}"
+    )
 
 
 def list_jobs(
@@ -88,8 +103,7 @@ def enqueue_from_row(row_id: int, db_path: str | None = None) -> dict:
         ).fetchone()
         if pending:
             raise ServiceError("该行已有进行中的补采任务")
-        n = conn.execute("SELECT COUNT(*) AS c FROM backfill_jobs").fetchone()["c"] + 1
-        code = f"BF-{n:04d}"
+        code = dead_letter_svc.next_job_code(conn)
         cur = conn.execute(
             """
             INSERT INTO backfill_jobs(job_code, row_id, status, attempt, message)
@@ -156,6 +170,7 @@ def run_job(job_id: int, succeed: bool = True, db_path: str | None = None) -> di
                 """,
                 (f"超过最大尝试次数 {max_attempt}", job_id),
             )
+            _seal_if_exhausted(conn, job_id, max_attempt)
             return get_job(job_id, db_path)
         now = datetime.now().isoformat(timespec="seconds")
         conn.execute(
@@ -242,6 +257,7 @@ def run_job(job_id: int, succeed: bool = True, db_path: str | None = None) -> di
                 """,
                 (job_id,),
             )
+            _seal_if_exhausted(conn, job_id, max_attempt)
     audit_svc.write_event(
         "执行补采",
         "backfill_job",
@@ -261,6 +277,12 @@ def retry_job(job_id: int, db_path: str | None = None) -> dict:
             raise ServiceError("补采任务不存在", 404)
         if job["status"] not in ("失败",):
             raise ServiceError("只有失败任务可以重试")
+        sealed = conn.execute(
+            "SELECT id FROM backfill_dead_letters WHERE job_id=? AND status='封存'",
+            (job_id,),
+        ).fetchone()
+        if sealed:
+            raise ServiceError("该任务已封存为死信，请走死信回炉")
         max_attempt = settings_svc.get_int("backfill_max_attempt", 3, db_path=db_path)
         if job["attempt"] >= max_attempt:
             raise ServiceError("已达最大尝试次数，不能重试")

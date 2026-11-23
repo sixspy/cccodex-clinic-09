@@ -77,6 +77,39 @@ CREATE TABLE IF NOT EXISTS backfill_jobs (
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- 死信回炉（甲案）：不可变快照 + 当场钉死键 + 指纹。
+-- 读侧只读 snapshot 一份；snapshot/fingerprint/pin_key/job_id/row_id 由触发器钉死，拒回刷。
+CREATE TABLE IF NOT EXISTS backfill_dead_letters (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  job_id INTEGER NOT NULL UNIQUE REFERENCES backfill_jobs(id),
+  row_id INTEGER NOT NULL REFERENCES visit_rows(id),
+  pin_key TEXT NOT NULL UNIQUE,
+  snapshot TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  status TEXT NOT NULL CHECK (status IN ('封存','已回炉')),
+  rework_job_id INTEGER REFERENCES backfill_jobs(id),
+  sealed_at TEXT NOT NULL DEFAULT (datetime('now')),
+  reworked_at TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TRIGGER IF NOT EXISTS trg_dead_letter_frozen
+BEFORE UPDATE ON backfill_dead_letters
+WHEN OLD.snapshot <> NEW.snapshot
+  OR OLD.fingerprint <> NEW.fingerprint
+  OR OLD.pin_key <> NEW.pin_key
+  OR OLD.job_id <> NEW.job_id
+  OR OLD.row_id <> NEW.row_id
+BEGIN
+  SELECT RAISE(ABORT, '死信快照已封存，拒绝回刷');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_dead_letter_no_delete
+BEFORE DELETE ON backfill_dead_letters
+BEGIN
+  SELECT RAISE(ABORT, '死信快照不可删除');
+END;
+
 CREATE TABLE IF NOT EXISTS reconcile_reports (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   summary TEXT NOT NULL,
@@ -116,6 +149,12 @@ def ensure_db() -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     with sqlite3.connect(path) as conn:
         conn.executescript(SCHEMA)
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO app_settings(key, value, label)
+            VALUES ('dead_letter_rework_caliber', '封存即钉死，回炉另起补采任务', '死信回炉口径')
+            """
+        )
         conn.commit()
     return path
 

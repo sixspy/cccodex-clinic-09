@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.db import get_db
 from app.services import audit as audit_svc
+from app.services import dead_letters as dead_letter_svc
 from app.services.errors import ServiceError
 
 
@@ -35,21 +36,26 @@ def dashboard(db_path: str | None = None) -> dict:
             SELECT status, COUNT(*) AS c FROM visit_batches GROUP BY status
             """
         ).fetchall()
-        return {
-            "sites": sites,
-            "sites_enabled": sites_enabled,
-            "protocols": protocols,
-            "batches": batches,
-            "rows": rows,
-            "gaps": gaps,
-            "open_findings": findings,
-            "pending_jobs": jobs,
-            "audits": audits,
-            "batch_status": {r["status"]: r["c"] for r in by_batch_status},
-        }
+    guard = dead_letter_svc.guard_state(db_path)
+    return {
+        "sites": sites,
+        "sites_enabled": sites_enabled,
+        "protocols": protocols,
+        "batches": batches,
+        "rows": rows,
+        "gaps": gaps,
+        "open_findings": findings,
+        "pending_jobs": jobs,
+        "audits": audits,
+        "batch_status": {r["status"]: r["c"] for r in by_batch_status},
+        "dead_letter_count": guard["dead_letter_count"],
+        "dead_letter_rework_badge": guard["rework_badge"],
+        "dead_letter_guard": guard,
+    }
 
 
 def run_reconcile(db_path: str | None = None) -> dict:
+    dead_letter_svc.sweep_exhausted(db_path)
     with get_db(db_path) as conn:
         gap_rows = conn.execute(
             """
@@ -97,9 +103,11 @@ def run_reconcile(db_path: str | None = None) -> dict:
             """
         ).fetchone()["c"]
         mismatch = orphan_gaps + stale_findings + uncovered
+        guard = dead_letter_svc.guard_state(db_path)
         summary = (
             f"缺口行{gap_rows} · 开放发现{open_findings} · 待执行补采{pending_jobs} · "
-            f"无发现缺口{orphan_gaps} · 陈旧发现{stale_findings} · 未覆盖补采{uncovered}"
+            f"无发现缺口{orphan_gaps} · 陈旧发现{stale_findings} · 未覆盖补采{uncovered} · "
+            f"死信{guard['dead_letter_count']}(回炉徽标{guard['rework_badge']} 落点{guard['landing_rows']})"
         )
         cur = conn.execute(
             """
@@ -117,6 +125,7 @@ def run_reconcile(db_path: str | None = None) -> dict:
             "orphan_gaps": orphan_gaps,
             "stale_findings": stale_findings,
             "uncovered_backfill": uncovered,
+            "dead_letter_guard": guard,
             "gap_by_quality": [
                 dict(r)
                 for r in conn.execute(
@@ -177,7 +186,13 @@ def site_gap_matrix(db_path: str | None = None) -> list[dict]:
               COUNT(DISTINCT b.id) AS batch_count,
               COUNT(r.id) AS row_count,
               SUM(CASE WHEN r.quality!='合格' AND r.status IN ('待检','待补采') THEN 1 ELSE 0 END) AS gap_count,
-              SUM(CASE WHEN f.status='开放' THEN 1 ELSE 0 END) AS open_findings
+              SUM(CASE WHEN f.status='开放' THEN 1 ELSE 0 END) AS open_findings,
+              (
+                SELECT COUNT(*) FROM backfill_dead_letters d
+                JOIN visit_rows dr ON dr.id=d.row_id
+                JOIN visit_batches db ON db.id=dr.batch_id
+                WHERE db.site_id=s.id
+              ) AS dead_letters
             FROM trial_sites s
             LEFT JOIN visit_batches b ON b.site_id=s.id
             LEFT JOIN visit_rows r ON r.batch_id=b.id

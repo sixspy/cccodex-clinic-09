@@ -11,6 +11,7 @@ from app.config import Config
 from app.seed import seed_if_needed
 from app.services import audit as audit_svc
 from app.services import backfill as backfill_svc
+from app.services import dead_letters as dead_letter_svc
 from app.services import protocols as protocols_svc
 from app.services import qc as qc_svc
 from app.services import reconcile as reconcile_svc
@@ -409,6 +410,29 @@ class Api:
 
     @cherrypy.expose
     @_wrap
+    def dead_letters(self, dead_letter_id=None, action=None):
+        _require()
+        method = cherrypy.request.method
+        q = _query()
+        if dead_letter_id is None:
+            if method != "GET":
+                return _json({"error": "方法不允许"}, 405)
+            return _json(
+                {
+                    "items": dead_letter_svc.list_dead_letters(status=q.get("status")),
+                    "summary": dead_letter_svc.summary(),
+                    "guard": dead_letter_svc.guard_state(),
+                }
+            )
+        did = int(dead_letter_id)
+        if action == "rework" and method == "POST":
+            return _json(dead_letter_svc.rework_dead_letter(did))
+        if action is None and method == "GET":
+            return _json(dead_letter_svc.get_dead_letter(did))
+        return _json({"error": "未知死信路由"}, 404)
+
+    @cherrypy.expose
+    @_wrap
     def reports(self, action=None):
         _require()
         method = cherrypy.request.method
@@ -514,6 +538,13 @@ class ApiMount:
             if len(parts) == 1:
                 return api.reports()
             return api.reports(action=parts[1])
+        if path == "/dead-letters" or path.startswith("/dead-letters/"):
+            parts = path.strip("/").split("/")
+            if len(parts) == 1:
+                return api.dead_letters()
+            if len(parts) == 2:
+                return api.dead_letters(dead_letter_id=parts[1])
+            return api.dead_letters(dead_letter_id=parts[1], action=parts[2])
         if path == "/settings" or path.startswith("/settings/"):
             parts = path.strip("/").split("/")
             if len(parts) == 1:
